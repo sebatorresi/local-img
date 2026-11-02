@@ -95,6 +95,24 @@ class PipelineCache:
             # No content filter. Nothing is blurred or replaced on the way out.
             kwargs.update(safety_checker=None, requires_safety_checker=False)
 
+        # SDXL's stock VAE overflows the fp16 range during decode and returns NaN.
+        # The run still reports success, so the failure reaches the user as a fully
+        # black PNG. This is the same VAE retrained to stay in range (~335 MB, shared
+        # by every SDXL model here). If it can't be fetched, the pipeline falls back
+        # to decoding in fp32 further down — slower, but never black.
+        vae_fixed = False
+        if spec.arch == "sdxl" and DTYPE == torch.float16:
+            from diffusers import AutoencoderKL
+
+            try:
+                on_status("loading fp16-safe VAE")
+                kwargs["vae"] = AutoencoderKL.from_pretrained(
+                    "madebyollin/sdxl-vae-fp16-fix", torch_dtype=DTYPE
+                )
+                vae_fixed = True
+            except Exception:
+                pass
+
         # Multi-GB downloads over a flaky link drop mid-transfer; already-fetched
         # shards stay in the HF cache, so retrying resumes rather than restarts.
         last = None
@@ -128,6 +146,12 @@ class PipelineCache:
         pipe = pipe.to(DEVICE)
         pipe.enable_attention_slicing()
         pipe.vae.enable_slicing()  # keeps VAE decode of a 1024px latent inside 16 GB
+
+        # Fallback when the fp16-safe VAE above could not be fetched: decode in fp32.
+        # Costs memory and a bit of time, but fp32 has the headroom fp16 lacks.
+        if spec.arch == "sdxl" and DTYPE == torch.float16 and not vae_fixed:
+            pipe.vae.to(torch.float32)
+            pipe.vae.config.force_upcast = True
 
         self.pipe, self.key = pipe, key
         return pipe
